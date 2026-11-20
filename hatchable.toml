@@ -1,0 +1,6 @@
+name = "InsightIQ"
+
+[ai]
+required = true
+providers = ["google"]
+description = "InsightIQ uses Gemini to explain verified sales and product metrics. Connect a Google Gemini API key in project Setup to enable AI analysis."
