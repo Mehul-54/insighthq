@@ -1,5 +1,3 @@
-import { ai } from "hatchable";
-
 export const access = "public";
 export const methods = ["POST"];
 
@@ -27,7 +25,6 @@ function aggregate(rows, key) {
 
 function buildSummary(rows) {
   const totalRevenue = rows.reduce((sum, row) => sum + number(row.revenue), 0);
-  const orderCount = rows.length;
   const byMonth = aggregate(rows.map(row => ({ ...row, month: monthKey(row.order_date) })), "month");
   const byProduct = aggregate(rows, "product_name");
   const bySegment = aggregate(rows, "customer_segment");
@@ -40,10 +37,10 @@ function buildSummary(rows) {
     change = previous ? Math.round(((current - previous) / previous) * 1000) / 10 : null;
   }
   return {
-    rowsAnalysed: orderCount,
+    rowsAnalysed: rows.length,
     totalRevenue: Math.round(totalRevenue * 100) / 100,
-    totalOrders: orderCount,
-    averageOrderValue: orderCount ? Math.round((totalRevenue / orderCount) * 100) / 100 : 0,
+    totalOrders: rows.length,
+    averageOrderValue: rows.length ? Math.round((totalRevenue / rows.length) * 100) / 100 : 0,
     latestMonthChangePercent: change,
     monthlyRevenue: months,
     revenueByProduct: byProduct,
@@ -59,7 +56,12 @@ function buildSummary(rows) {
   };
 }
 
-export default async function (req, res) {
+export default async function handler(req, res) {
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    return res.status(405).json({ error: "Method not allowed." });
+  }
+
   const body = req.body || {};
   const question = typeof body.question === "string" ? body.question.trim() : "";
   const rows = Array.isArray(body.rows) ? body.rows : [];
@@ -77,6 +79,11 @@ export default async function (req, res) {
     return res.status(400).json({ error: "Dataset must include order_date, product_name, customer_segment and revenue columns." });
   }
 
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return res.status(503).json({ error: "Gemini is not configured yet. Add GEMINI_API_KEY in Vercel Project Settings → Environment Variables, then redeploy." });
+  }
+
   const summary = buildSummary(rows);
   const system = [
     "You are InsightIQ, a careful product analytics copilot for Product Managers.",
@@ -89,32 +96,46 @@ export default async function (req, res) {
   ].join("\n");
 
   try {
-    const result = await ai.generateText({
-      model: "gemini",
-      purpose: "insightiq-product-analysis",
-      system,
-      prompt: "PRODUCT MANAGER QUESTION:\n" + question + "\n\nVERIFIED DATA SUMMARY (JSON):\n" + JSON.stringify(summary),
-      maxTokens: 1000,
+    const response = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + encodeURIComponent(apiKey), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: system }] },
+        contents: [{
+          role: "user",
+          parts: [{ text: "PRODUCT MANAGER QUESTION:\n" + question + "\n\nVERIFIED DATA SUMMARY (JSON):\n" + JSON.stringify(summary) }]
+        }],
+        generationConfig: { maxOutputTokens: 1000, temperature: 0.2 }
+      }),
       signal: AbortSignal.timeout(45000)
     });
 
-    if (result.finishReason === "length") {
-      return res.status(502).json({ error: "The AI response was cut off. Please try a more focused question." });
+    const result = await response.json();
+    if (!response.ok) {
+      console.error("Gemini API error:", result?.error?.message || response.status);
+      return res.status(502).json({ error: "Gemini could not complete the analysis. Check the API key and try again." });
     }
 
-    return res.json({
-      answer: result.text,
+    const answer = (result.candidates?.[0]?.content?.parts || [])
+      .map(part => part.text || "")
+      .join("\n")
+      .trim();
+
+    if (!answer) {
+      return res.status(502).json({ error: "Gemini returned an empty answer. Please try a more focused question." });
+    }
+
+    return res.status(200).json({
+      answer,
       evidence: {
         rowsAnalysed: summary.rowsAnalysed,
         totalRevenue: summary.totalRevenue,
         latestMonthChangePercent: summary.latestMonthChangePercent
       },
-      model: "Gemini"
+      model: "Gemini 2.5 Flash"
     });
   } catch (error) {
-    console.log("InsightIQ analysis error:", error?.message || String(error));
-    return res.status(502).json({
-      error: "AI analysis is temporarily unavailable. Check that a Google AI provider key is connected in Hatchable Setup, then try again."
-    });
+    console.error("InsightIQ analysis error:", error?.message || String(error));
+    return res.status(502).json({ error: "AI analysis is temporarily unavailable. Please try again." });
   }
 }
